@@ -1,0 +1,15 @@
+opencv-python 
+face_recognition 
+moviepy ==1.0.3
+scikit-learn 
+pandas 
+openpyxl 
+
+
+openai-whisper 
+openai
+tqdm
+scikit-image
+torchvision  
+transformers 
+sentence-transformers 
