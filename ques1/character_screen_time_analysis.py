@@ -101,84 +101,96 @@ def sample_frames(video_path, fps_sampling=1.0, save_frames=False, frame_out_dir
     return frames
 
 
-def detect_faces_in_frames_mtcnn(frames, resize_to=None, min_face_size=20):
+def detect_faces_in_frames_mtcnn(frames, min_face_size=20):
     """
     Detect faces using facenet-pytorch MTCNN and compute embeddings with InceptionResnetV1.
-    Returns list of dicts: { time, boxes, crops, embeddings }
-    - boxes: list of (left, top, right, bottom)
-    - crops: list of numpy arrays (bgr uint8) useful for debug/save
-    - embeddings: list of 512-d numpy arrays (float32) or torch tensors on cpu
-    Prints progress and counts.
+    Returns list of dicts:
+        { time, boxes, embeddings, crops }
+    boxes = [ {left, top, right, bottom, w, h, cx, cy}, ... ]
+    embeddings = [512-dim numpy arrays]
+    crops = raw image crops for debugging (optional)
     """
     print("Detecting faces with MTCNN and computing embeddings with InceptionResnetV1")
     results = []
-    device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device for face models: {device_str}")
+
     for t, frame in tqdm(frames, desc="MTCNN detect+embed"):
-        # mtcnn expects PIL or ndarray in RGB
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # mtcnn( ) with keep_all=True returns cropped PIL images when `return_prob=False`
-        # Use mtcnn.detect to get boxes, then mtcnn.extract? Simpler: call mtcnn on the frame to get boxes and face tensors.
-        # We'll use mtcnn to return cropped face tensors.
+
         try:
-            # faces = list of PIL.Image or torch.Tensor depending on mtcnn config
-            # boxes: numpy array Nx4 in (x1,y1,x2,y2) or None
+            # Detect face boxes
             boxes, probs = mtcnn.detect(rgb)
-            crops = []
-            embeddings = []
-            boxes_list = []
+
             if boxes is None:
-                results.append({'time': t, 'boxes': [], 'crops': [], 'embeddings': []})
+                results.append({"time": t, "boxes": [], "embeddings": [], "crops": []})
                 continue
 
-            # mtcnn.extract one-by-one to get aligned faces: use mtcnn.forward? easiest: use mtcnn to crop using .crop
-            # facenet-pytorch's MTCNN can be used to return face tensors via mtcnn(rgb, return_prob=True) but that returns stacked tensors.
-            faces_tensors = mtcnn(rgb, return_prob=False)  # returns None or list of tensors or a single tensor
-            # faces_tensors can be a torch.Tensor (N,3,160,160) or a single tensor when N==1
+            # Extract aligned faces (returns tensors Nx3x160x160)
+            faces_tensors = mtcnn.extract(rgb, boxes, save_path=None)
+
             if faces_tensors is None:
-                results.append({'time': t, 'boxes': [], 'crops': [], 'embeddings': []})
+                results.append({"time": t, "boxes": [], "embeddings": [], "crops": []})
                 continue
 
-            # normalize shapes: make list of face tensors
+            # Normalize faces_tensors → always list of tensors
             if isinstance(faces_tensors, torch.Tensor):
-                face_t_list = [faces_tensors[i].to(device) for i in range(faces_tensors.shape[0])]
+                faces_tensor_list = [faces_tensors[i].to(device) for i in range(faces_tensors.shape[0])]
             else:
-                face_t_list = [f.to(device) for f in faces_tensors]
+                faces_tensor_list = [f.to(device) for f in faces_tensors]
 
-            # convert boxes to int list
+            final_boxes = []
+            crops = []
+
             for b in boxes:
-                x1, y1, x2, y2 = [int(round(v)) for v in b]
-                w = max(1, x2 - x1)
-                h = max(1, y2 - y1)
+                x1, y1, x2, y2 = [int(v) for v in b]
+                w, h = x2 - x1, y2 - y1
+
                 if w < min_face_size or h < min_face_size:
                     continue
-                boxes_list.append({'left': x1, 'top': y1, 'right': x2, 'bottom': y2, 'w': w, 'h': h,
-                                   'cx': x1 + w/2, 'cy': y1 + h/2})
-                # extract crop for optional saving/debug
-                crop = frame[y1:y2, x1:x2].copy() if y2>y1 and x2>x1 else np.zeros((min_face_size,min_face_size,3), dtype=np.uint8)
+
+                final_boxes.append({
+                    "left": x1, "top": y1, "right": x2, "bottom": y2,
+                    "w": w, "h": h,
+                    "cx": x1 + w/2, "cy": y1 + h/2
+                })
+
+                crop = frame[y1:y2, x1:x2].copy()
                 crops.append(crop)
 
-            # compute embeddings in batch for all face_t_list
-            if len(face_t_list) > 0:
-                # create batch
-                batch = torch.stack(face_t_list).to(device)
-                with torch.no_grad():
-                    embs = resnet(batch).cpu().numpy()  # shape (N,512)
-                embeddings = [emb.astype(np.float32) for emb in embs]
-            else:
-                embeddings = []
+            # Recompute faces tensor list to match filtered boxes
+            filtered_faces = []
+            for i in range(len(final_boxes)):
+                filtered_faces.append(faces_tensor_list[i])
 
-            # ensure lengths align: boxes_list and embeddings should correspond in order returned by mtcnn
-            # NOTE: MTCNN returns detections in same order as faces_tensors
-            results.append({'time': t, 'boxes': boxes_list, 'crops': crops, 'embeddings': embeddings})
+            if len(filtered_faces) == 0:
+                results.append({"time": t, "boxes": [], "embeddings": [], "crops": []})
+                continue
+
+            batch = torch.stack(filtered_faces).to(device)
+
+            with torch.no_grad():
+                embs = resnet(batch).cpu().numpy()
+
+            embeddings = [e.astype(np.float32) for e in embs]
+
+            results.append({
+                "time": t,
+                "boxes": final_boxes,
+                "embeddings": embeddings,
+                "crops": crops
+            })
+
         except Exception as e:
-            print(f"Warning: MTCNN error at t={t:.2f}s: {e}")
-            results.append({'time': t, 'boxes': [], 'crops': [], 'embeddings': []})
-    # summary
-    total_faces = sum([len(r['embeddings']) for r in results])
-    print(f"MTCNN detected {total_faces} face crops across {len(results)} sampled frames")
-    return results
+            print(f"[Warning] MTCNN error at t={t:.2f}s → {e}")
+            results.append({"time": t, "boxes": [], "embeddings": [], "crops": []})
 
+    total_faces = sum(len(r["embeddings"]) for r in results)
+    print(f"✅ Total detected faces: {total_faces} across {len(results)} frames")
+
+    return results
 
 def cluster_face_encodings(all_encodings, eps=0.5, min_samples=3):
     if len(all_encodings) == 0:
